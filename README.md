@@ -15,6 +15,30 @@
 >
 > Do NOT build from `prism-v6` (stale mid-migration snapshot) and do NOT mix this fork's `ggml-*` libraries with a stock llama.cpp build.
 
+> [!NOTE]
+> **taxah92 Fork: NVIDIA Volta (SM70 / Tesla V100) & MTP Optimizations**
+>
+> This fork ([taxah92/llama.cpp](https://github.com/taxah92/llama.cpp)) builds upon [PrismML-Eng/llama.cpp](https://github.com/PrismML-Eng/llama.cpp) (branch `prism`) with critical fixes and performance improvements specifically targeting **NVIDIA Volta (SM70, Tesla V100)** architectures and **MTP (Multi-Token Prediction)** speculative decoding:
+>
+> 1. **Volta Shared Memory Limit Fix for Flash Attention (`ggml-cuda/fattn-mma-f16.cuh`)**:
+>    - On Volta (compute capability 7.0), warps execute with 32 columns per warp (compared to 16 on Ampere+). With default `nbatch_combine = 128`, combine shared memory was $8 \times 32 \times (128+4) \times 4 = 135\text{ KB}$, exceeding Volta's physical 96 KB SM limit and triggering fatal `cudaErrorInvalidValue` crashes.
+>    - Added tuned Volta MMA kernel configs for $D_{KQ}=256, D_V=256$ and $D_{KQ}=320, D_V=256$ with `nbatch_combine = 64` (69 KB $\le$ 96 KB opt-in limit) and `nbatch_fa = 32` (35 KB $\le$ 48 KB hardware limit), enabling stable, native Flash Attention on Volta.
+>
+> 2. **Quantized KV Cache Flash Attention Vector Dispatch (`ggml-cuda/fattn.cu`)**:
+>    - Adjusted `ggml_cuda_get_best_fattn_kernel` on Volta so quantized KV caches (`Q4_0` / `Q8_0`) select `BEST_FATTN_KERNEL_VEC` when $Q_{ne[1]} \le 4$ without multiplying by `gqa_ratio_eff`.
+>    - This avoids falling back to MMA tile kernels that require dequantizing the entire KV context to FP16 in VRAM during MTP verification steps.
+>
+> 3. **MTP Draft Acceptance Fix & Deterministic Argmax Sampling (`common/speculative.cpp`)**:
+>    - **Root Cause Fixed:** Attempting GPU backend offload (`backend_sampling`) bypassed CPU candidate distribution construction and probability calculations, leaving candidate probabilities at $p = 0.0\text{f}$. `draft()` read from the unsorted array and emitted garbage tokens (e.g. `165552 ("ansir")`) on every step, causing a 0.00% draft acceptance collapse.
+>    - **Solution:** Enforced CPU-based greedy argmax sampling for MTP (`this->params.backend_sampling = false`, `sparams.top_k = 1`), restoring draft acceptance from **0%** to **50%–100% (avg ~61%)** and boosting generation speed from 25–35 tok/s to **52–70.5 tok/s**.
+>
+> 4. **Full 256K Context on 16GB VRAM (Tesla V100-SXM2-16GB)**:
+>    - Verified stable 262,144-token context in **15,115 MiB / 16,384 MiB** VRAM on `Ternary-Bonsai-2-27B-Abliterated-PQ2_0-MTP.gguf` using `Q4_0` KV cache with mean-centering bias (`--kv-mean-center` with `LLAMA_ATTN_ROT_DISABLE=1`).
+>
+> 5. **Multimodal Projector (`mmproj`) Sizing Guidelines for 16GB VRAM**:
+>    - **GPU Vision Offload (Fast, 281 prompt tok/s):** Set `--ctx-size 220000` with `--mmproj Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf` (uses 14,817 MiB VRAM, 1.57 GB headroom for image activation buffers). 512x512 image processes in 1.13s.
+>    - **Max Context (256K / 262,144 tokens):** Use `--no-mmproj-offload` to keep `mmproj` in host RAM (28 GB available), keeping full 256K context in VRAM with vision processing on CPU (~4.1s per image).
+
 ---
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
