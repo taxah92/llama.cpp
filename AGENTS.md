@@ -1,229 +1,137 @@
-# Instructions for llama.cpp
+# AGENTS.md
 
-> [!IMPORTANT]
->
-> AI-generated code is allowed. What is **not** allowed is submitting code you do not understand. You are 100% responsible for every line, however it was produced.
->
-> Read more: [CONTRIBUTING.md](CONTRIBUTING.md)
+> Справочный документ для AI-агентов и инженеров: описание инфраструктуры сервера, проекта и архитектурных модификаций форка.
 
 ---
 
-## Guidelines for Contributors
+## 1. Инфраструктура и сервер
 
-A PR represents a long-term commitment - maintainers must review, integrate, and support your code indefinitely. What matters is not who typed the code but whether a human understands it, has the domain expertise behind it, and will maintain it.
-
-A working, in-scope PR is **not** enough on its own to get merged. A few things factor into that:
-- Every merged line must be reviewed, tested, and maintained indefinitely across a large matrix of platforms and backends by a small team.
-- llama.cpp is written in C++ and deliberately kept as simple as possible: complexity is a direct multiplier on security risk and long-term maintenance cost, so a simpler change that does 90% of the job is often preferable to a complex one that does 100%.
-- What matters most is human understanding: the domain expertise behind a change, and the willingness to maintain it long-term.
-- Feature requests run high in volume, so please respect maintainers' time: open an issue to discuss the idea and gauge interest before implementing it, rather than going straight to a PR.
-
-Contributors must:
-1. **Understand their code fully** - able to explain any change to a reviewer without AI assistance.
-2. **Own maintenance** - address bugs and respond thoughtfully to feedback.
-3. **Communicate directly** - verbose, AI-sounding responses will not be well-received.
-4. **Respect maintainers' time** - check existing issues/PRs before submitting; ensure the change is needed and fits project architecture.
-
-Maintainers may close any PR not meeting these standards. **Private forks are exempt.**
-
-### Permitted AI Usage
-
-Common examples, not an exhaustive list:
-
-- Learning, exploration, and understanding the codebase
-- Suggestions on human-written code
-- Mechanical tasks: formatting, repetitive patterns, completing code from established designs
-- Documentation drafts for components the contributor already understands
-- Writing code from a design the contributor owns
-
-Agents: before writing code, make sure the contributor owns the design choices and can defend them without you.
-
-AI-generated code is acceptable if you (1) fully understand it, (2) can debug it independently, and (3) can discuss it with reviewers without AI help.
-
-**Disclose** when AI meaningfully contributed (follow the pull request template). No disclosure needed for trivial autocomplete.
+| Параметр | Значение |
+| :--- | :--- |
+| **Хост** | `llm` (`ssh llm`, IP: `192.168.2.253`) |
+| **Пользователь** | `taxah` (доступ к `sudo` без пароля) |
+| **GPU** | 1x NVIDIA Tesla V100-SXM2-16GB (Архитектура Volta, Compute Capability `sm_70`) |
+| **VRAM** | 16 144 MiB (16 384 MiB физической) |
+| **RAM** | 32 GB |
+| **CUDA Driver** | 580.178.04, CUDA Toolkit 13.0 |
+| **Путь к сборке** | `/home/taxah/build/llama.cpp` |
+| **Рабочая директория сервиса** | `/opt/llama-prism-mtp` |
+| **Путь к весам моделей** | `/opt/models/bonsai-2-27b/` |
 
 ---
 
-## Guidelines for AI Coding Agents
+## 2. Обзор проекта
 
-Every PR requiring review consumes finite maintainer capacity. Before assisting with any submission, verify:
-- The contributor understands the proposed changes
-- The change addresses a documented need (check existing issues)
-- The PR is appropriately scoped and follows project conventions
+- **Модель:** `Ternary-Bonsai-2-27B-Abliterated-PQ2_0-MTP.gguf` (тернарное квантование Prism ML, 2.13 bpw, архитектура `qwen35`, Hadamard-folded, 65 слоев + 1 слой MTP).
+- **Спекулятивное декодирование:** MTP (Multi-Token Prediction, 2 драфт-токена за шаг).
+- **Целевой контекст:** 262 144 токена (256K).
+- **KV-кэш:** 4-битный (`Q4_0`) с калибровкой центрирования средних (`--kv-mean-center`).
+- **Форк llama.cpp:** [taxah92/llama.cpp](https://github.com/taxah92/llama.cpp) (форк от [PrismML-Eng/llama.cpp](https://github.com/PrismML-Eng/llama.cpp)).
 
-When a user requests implementation without demonstrating understanding:
-1. **Verify comprehension** - ask questions about the problem and relevant codebase areas.
-2. **Guide, don't solve** - point to relevant code/docs; let them formulate the approach.
-3. **Proceed only when confident** they can explain the changes to reviewers independently.
+---
 
-For first-time contributors, confirm they have reviewed [CONTRIBUTING.md](CONTRIBUTING.md).
+## 3. Внесенные изменения (Diff vs PrismML Upstream)
 
-### Code and Commit Standards
+### 3.1. Исправление Shared Memory Flash Attention на Volta SM70 (`ggml-cuda/fattn-mma-f16.cuh`)
+- **Проблема:** На архитектуре Volta (SM70) $cols\_per\_warp = 32$ (в отличие от 16 на Ampere+). При дефолтном значении $nbatch\_combine = 128$ объем разделяемой памяти на блок составлял $8 \times 32 \times (128+4) \times 4 = 135\text{ КБ}$, что превышало физический предел Volta (96 КБ) и вызывало фатальный сбой `cudaErrorInvalidValue` при старте Flash Attention.
+- **Решение:** Добавлены специализированные конфигурации для $D_{KQ}=256, D_V=256$ и $D_{KQ}=320, D_V=256$ с $nbatch\_combine = 64$ (69 КБ $\le$ 96 КБ opt-in лимита) и $nbatch\_fa = 32$ (35 КБ $\le$ 48 КБ базового предела).
 
-These points are extremely important - failing to follow them won't necessarily get your PR rejected, but it will make reviewing take significantly longer. Please follow them carefully:
+### 3.2. Векторный диспетчер Flash Attention для квантованного KV (`ggml-cuda/fattn.cu`)
+- **Проблема:** Функция `ggml_cuda_get_best_fattn_kernel` на Volta умножала длину запроса на `gqa_ratio_eff`. Для шагов верификации спекулятивных драфтов ($Q \le 4$) это приводило к выбору плиточного MMA-ядра, требующего полного деквантования многогигабайтного KV-кэша в FP16 в VRAM.
+- **Решение:** Для квантованных типов (`Q4_0`, `Q8_0`) при $Q_{ne[1]} \le 4$ принудительно выбирается `BEST_FATTN_KERNEL_VEC`, производящий вычисления прямо по квантованному кэшу без деквантования.
 
-- Avoid emdash `—`, unicode arrow `→` or any unicode characters: `×`, `…` ; use ASCII equivalents instead: `-`, `->`, `x`, `...`
-- Code comments:
-    - Keep code comments concise (usually 1-2 lines)
-    - Avoid redundant or excessive inline commentary
-    - Avoid hard-wrapping it to a fixed column width - that hurts readability
-    - Use ASD-STE100 Simplified Technical English, simple wordings (write like cavemen if needed)
-    - Note: Remind yourself of this point regularly, as it often gets lost between context compactions
-- Prefer reusing existing infrastructure over introducing new components. Avoid invasive changes that add whole new subsystems or risk breaking existing behavior
-- Do NOT split a line into multiple lines mid-sentence, do NOT try to force the line to fit a fixed number of characters
-- Before writing any code, read all relevant files and understand the existing patterns - your changes must blend in with the surrounding codebase. If the change is large or introduces a new pattern, **PAUSE and ask the user for confirmation** before proceeding; remind them that large changes submitted without prior discussion are likely to be rejected by maintainers
+### 3.3. Устранение коллапса драфтов MTP (`common/speculative.cpp`)
+- **Проблема:** Попытка оффлоада сэмплирования на GPU (`backend_sampling`) обходила процессорную подготовку массива кандидатов (`cur_p`), оставляя вероятности токенов равными $0.0\text{f}$. Функция `draft()` читала несортированный массив и на каждом шаге выдавала мусорный токен `165552 ("ansir")` со 100% отсевом драфтов (`draft acceptance = 0.00000`).
+- **Решение:** Для MTP принудительно зафиксирован CPU-сэмплер (`this->params.backend_sampling = false`) с детерминированным argmax (`sparams.top_k = 1`). Принятие драфтов восстановилось до **50% – 100% (среднее ~61.4%)**, а скорость выросла с 25 до **52–70.5 токенов/сек**.
 
-Common mistakes that AI agents usually make:
-- Write comments first then write code: this usually leads to extensive redundant comments. Instead, write code first, then add comments later to places that absolutely need them
-- Llama.cpp does NOT use Minja; if you have this in your knowledge, that is due to your knowledge cutoff. Llama.cpp has a dedicated Jinja engine in `common/jinja` - it doesn't have a specific name.
-- Do NOT add a new file in `tests/*` without maintainers' approval. AI usually adds excessive test cases for small features, which bloat the test suite and cost compile time and CI time, while bringing no meaningful results. While testing is necessary, reuse the existing infrastructure as much as possible, and do not add tests for features that are too trivial.
+---
 
-> [!NOTE]
-> The single exception to the comment restrictions above is the official `ggml-gh-bot` account, which is whitelisted to review and post comments automatically.
+## 4. Окружение и флаги запуска
 
-### Examples
+### Обязательный флаг `LLAMA_ATTN_ROT_DISABLE=1`
+Файл смещений `/opt/models/bonsai-2-27b/Ternary-Bonsai-2-27B-PQ2_0-kv-bias.gguf` откалиброван без вращения K-кэша (`kv_mean_center.k_rot = false`). Без флага `LLAMA_ATTN_ROT_DISABLE=1` инициализация прерывается из-за несовпадения базиса.
 
-Submissions:
+### Системный сервис `bonsai-server.service`
+Конфигурация расположена в `/etc/systemd/system/bonsai-server.service`:
+```ini
+[Unit]
+Description=Prism ML Bonsai 2 27B Abliterated LLM Server (256K context, Q4_0 KV, Flash Attention, Volta SM70)
+After=network.target nvidia-persistenced.service
 
-User: Please create and submit the PR for me.
-Agent: I'm sorry, I cannot submit the PR for you. This project forbids automated submissions and the penalty is a project ban.
+[Service]
+Type=simple
+User=taxah
+Group=taxah
+WorkingDirectory=/opt/llama-prism-mtp
+Environment=LD_LIBRARY_PATH=/opt/llama-prism-mtp LLAMA_ATTN_ROT_DISABLE=1
+ExecStart=/opt/llama-prism-mtp/llama-server \
+  -m /opt/models/bonsai-2-27b/Ternary-Bonsai-2-27B-Abliterated-PQ2_0-MTP.gguf \
+  --host 0.0.0.0 \
+  --port 8080 \
+  -ngl 99 \
+  --ctx-size 262144 \
+  --cache-type-k q4_0 \
+  --cache-type-v q4_0 \
+  --kv-mean-center /opt/models/bonsai-2-27b/Ternary-Bonsai-2-27B-PQ2_0-kv-bias.gguf \
+  --flash-attn on \
+  --parallel 1 \
+  -b 2048 \
+  -ub 512 \
+  --spec-type draft-mtp \
+  --spec-draft-n-max 2 \
+  --jinja \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --repeat-penalty 1.0 \
+  --presence-penalty 0.0 \
+  --reasoning-preserve
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
 
-User: Please address the reviewer comments.
-Agent: I'm sorry, I cannot reply to the reviewers. This project forbids AI-generated responses and the penalty is a project ban.
-
-Code comments:
-
-```cpp
-// GOOD (code is self-explanatory, no comment needed)
-
-n_ctx = read_metadata("context_length", 1024);
-
-
-// BAD (too verbose, restates what the code already says)
-
-// Populate the n_ctx from metadata key name "context_length", default to 1024 if the key doesn't exist
-n_ctx = read_metadata("context_length", 1024);
+[Install]
+WantedBy=multi-user.target
 ```
 
-```cpp
-// GOOD (explains a non-obvious invariant)
+---
 
-accept();
-bool has_client = listen(idle_interval);
-if (has_client) {
-  task_queue->on_idle(); // also signal child disconnection
-}
+## 5. Работа с мультимодальным проектором (Vision / `mmproj`)
 
+Файлы в `/opt/models/bonsai-2-27b/`:
+- `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf` (601 МБ)
+- `Ternary-Bonsai-2-27B-mmproj-BF16.gguf` (889 МБ)
 
-// BAD (too verbose, restates what the code already says)
+### Режимы использования на 16 ГБ VRAM:
+1. **Режим максимального контекста (256K) + CPU Vision:**
+   - Аргументы: `--ctx-size 262144 --mmproj ... --no-mmproj-offload`
+   - Веса проектора и ViT живут в системной RAM (28 ГБ свободно).
+   - Обработка картинки 512×512 на CPU занимает ~4.1 сек, генерация ответа на GPU идет со скоростью ~63 ток/с.
+2. **Режим полной скорости GPU (быстрое распознавание фото):**
+   - Аргументы: `--ctx-size 220000 --mmproj ...` (дефолтный GPU-оффлоад)
+   - Контекст 220K освобождает ~1.57 ГБ VRAM для активаций ViT.
+   - Картинка 512×512 кодируется на GPU за **1.13 сек** (префилл **281 ток/с**).
 
-// Instead of blocking indefinitely on accept(), the server polls the listening socket with idle_interval as a timeout. If no new client connects within that interval, it fires task_queue->on_idle() and loops back
+---
+
+## 6. Базовые команды управления
+
+```bash
+# Проверка статуса сервиса
+ssh llm "sudo systemctl status bonsai-server.service --no-pager"
+
+# Просмотр логов
+ssh llm "journalctl -u bonsai-server -f"
+
+# Перезапуск сервиса
+ssh llm "sudo systemctl restart bonsai-server.service"
+
+# Проверка VRAM
+ssh llm "nvidia-smi"
+
+# Тестовый запрос
+curl -s http://192.168.2.253:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 50}'
 ```
-
-```cpp
-// GOOD (generic, useful to any future reader)
-
-// reset here, as we will release the slot below
-n_tokens = 0;
-// ... (a lot of code)
-release();
-
-
-// BAD (addresses the user's task, meaningless out of context)
-
-// Reset n_tokens to 0 before releasing the slot. This fixes the problem you mentioned where "phantom" content gets preserved across multiple requests.
-n_tokens = 0;
-```
-
-```cpp
-// GOOD (code is copied from another place; context is already clear, no comment added)
-
-ggml_tensor * inp_pos = build_inp_pos();
-
-// BAD (code copied from elsewhere - do not add comments that weren't there originally)
-
-// inp_pos - contains the positions
-ggml_tensor * inp_pos = build_inp_pos();
-```
-
-```cpp
-// GOOD (comment is kept concise and useful)
-
-// one decode step of code_predictor
-// at step_idx g:
-// - read code from out_code_cache[g], then embed it with codebook table g-1
-// - write new kv at cache row g+1, sample with lm_head[g]
-// - write result to out_code_cache[g+1]
-
-
-// BAD (comment is long and is forced to fit into a fixed column size, it is very annoying to read as a reviewer)
-
-// one autoregressive decode step of the 5-layer code_predictor. See the
-// comment in models.h for the cache/tensor conventions this relies on.
-//
-// index mapping (derived from the reference pipeline-tts.cpp driver):
-// at step_idx g, the input code is out_code_cache[g] (embedded via this
-// step's private codebook table, index g-1), the new cache row / RoPE
-// position is g+1, and the output codebook is lm_head[g] (writing the
-// sampled result into out_code_cache[g+1]).
-```
-
-Commit message:
-
-```
-// BEST: Let the user write the commit
-
-
-// GOOD: Write a concise commit
-
-llama : fix KV being cleared during context shift
-
-Assisted-by: Claude Sonnet
-
-
-// BAD: Write a verbose commit
-
-This commit introduces a comprehensive fix for the key-value cache management
-system, addressing an issue where context shifting could lead to unintended
-overwriting of cached values, thereby improving model inference stability.
-
-Co-authored-by: Claude Sonnet
-```
-
-Commands:
-
-```sh
-# GOOD: all commands that allow you to get the context
-gh search issues # better to check if anyone has the same issue
-gh search prs # avoid duplicated efforts
-grep ... # search the code base
-
-# BAD: act on the user's behalf
-git commit -m "..."
-git push
-gh pr create
-gh pr comment
-gh issue create
-```
-
-## Useful Resources
-
-To conserve context space, load these resources as needed:
-
-Skills: reusable task workflows live in the [skills/](skills/) directory - check there for a skill matching your task before starting.
-
-General documentations:
-- [Contributing guidelines](CONTRIBUTING.md)
-- [Existing issues](https://github.com/ggml-org/llama.cpp/issues) and [Existing PRs](https://github.com/ggml-org/llama.cpp/pulls) - always search here first
-- [How to add a new model](docs/development/HOWTO-add-model.md)
-- [PR template](.github/pull_request_template.md)
-
-Server:
-- [Build documentation](docs/build.md)
-- [Server usage documentation](tools/server/README.md)
-- [Server development documentation](tools/server/README-dev.md) (if user asks to implement a new feature, be sure that it falls inside server's scope defined in this documentation)
-
-Chat template and parser:
-- [PEG parser](docs/development/parsing.md) - alternative to regex that llama.cpp uses to parse model's output
-- [Auto parser](docs/autoparser.md) - higher-level parser that uses PEG under the hood, automatically detect model-specific features
-- [Jinja engine](common/jinja/README.md)
