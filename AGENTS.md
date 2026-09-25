@@ -27,6 +27,7 @@
 - **Целевой контекст:** 262 144 токена (256K).
 - **KV-кэш:** 4-битный (`Q4_0`) с калибровкой центрирования средних (`--kv-mean-center`).
 - **Форк llama.cpp:** [taxah92/llama.cpp](https://github.com/taxah92/llama.cpp) (форк от [PrismML-Eng/llama.cpp](https://github.com/PrismML-Eng/llama.cpp)).
+- **Источник вдохновения и референс:** [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) — инженерный форк vLLM с оптимизациями низкобитного KV-кэша и внимания под архитектуру NVIDIA Volta (SM70, Tesla V100).
 
 ---
 

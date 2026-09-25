@@ -38,6 +38,9 @@
 > 5. **Multimodal Projector (`mmproj`) Sizing Guidelines for 16GB VRAM**:
 >    - **GPU Vision Offload (Fast, 281 prompt tok/s):** Set `--ctx-size 220000` with `--mmproj Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf` (uses 14,817 MiB VRAM, 1.57 GB headroom for image activation buffers). 512x512 image processes in 1.13s.
 >    - **Max Context (256K / 262,144 tokens):** Use `--no-mmproj-offload` to keep `mmproj` in host RAM (28 GB available), keeping full 256K context in VRAM with vision processing on CPU (~4.1s per image).
+>
+> **Inspiration & Engineering Reference:**
+> - [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) — deep engineering reference for low-bit KV cache and attention optimizations on NVIDIA Volta (SM70, Tesla V100).
 
 ---
 
