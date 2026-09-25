@@ -3,6 +3,7 @@
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
+#include "fattn-vec-gqa.cuh"
 #include "fattn.cuh"
 
 template <int DKQ, int DV, int ncols2>
@@ -327,11 +328,35 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     GGML_ABORT("fatal error");
 }
 
+// Dedicated GQA-packed decode kernel: packs all query heads that share a KV head into a single CTA and
+// reads the quantized K/V cache directly (no full F16 conversion).
+static void ggml_cuda_flash_attn_ext_vec_gqa(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_tensor * Q = dst->src[0];
+    ggml_tensor * K = dst->src[1];
+    ggml_tensor * V = dst->src[2];
+
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    if (Q->ne[0] == 256 && K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0) {
+        if (gqa_ratio % 6 == 0) {
+            ggml_cuda_flash_attn_ext_vec_gqa_case<256, 6, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>(ctx, dst);
+            return;
+        }
+        if (gqa_ratio % 2 == 0) {
+            ggml_cuda_flash_attn_ext_vec_gqa_case<256, 2, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>(ctx, dst);
+            return;
+        }
+    }
+
+    GGML_ABORT("fatal error");
+}
+
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE    =   0,
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
+    BEST_FATTN_KERNEL_VEC_GQA = 110,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
 };
 
@@ -488,6 +513,28 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         gqa_ratio_eff *= 2;
     }
 
+    // Dedicated GQA-packed decode kernel for quantized K/V: packs all query heads that share a KV head
+    // into one CTA and reads the quantized cache directly, so neither the full F16 conversion of the
+    // tensor core kernels nor the redundant K/V reads of the generic vector kernel are needed.
+    float logit_softcap_sel = 0.0f;
+    memcpy(&logit_softcap_sel, (const float *) KQV->op_params + 2, sizeof(float));
+    // Experimental: the GQA-packed kernel is correct but ~2.5x slower per op than the tile kernel
+    // (per-row reductions vs. tile-based amortization), so it is opt-in only. See V100_FA_KERNEL_PLAN.md.
+    static const bool gqa_packed_enabled = getenv("GGML_FA_GQA") != nullptr;
+    if (gqa_packed_enabled && volta_mma_available(cc) && Q->ne[0] == 256 && V->ne[0] == 256 &&
+            K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0 &&
+            Q->ne[1] == 2 && Q->ne[3] == 1 && mask && max_bias == 0.0f &&
+            logit_softcap_sel == 0.0f && dst->src[4] == nullptr &&
+            (gqa_ratio % 6 == 0 || gqa_ratio % 2 == 0)) {
+        static bool printed_gqa = false;
+        if (!printed_gqa && getenv("GGML_FA_DEBUG") != nullptr) {
+            printed_gqa = true;
+            fprintf(stderr, "ggml_cuda_get_best_fattn_kernel: using GQA-packed vector kernel (gqa_ratio = %d, kv = %d)\n",
+                    gqa_ratio, (int) K->ne[1]);
+        }
+        return BEST_FATTN_KERNEL_VEC_GQA;
+    }
+
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
@@ -557,6 +604,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32;
             need_f16_V = V->type == GGML_TYPE_F32;
             break;
+        case BEST_FATTN_KERNEL_VEC_GQA:
+            need_f16_K = false;
+            need_f16_V = false;
+            break;
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
@@ -569,7 +620,16 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel kernel_chosen = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    static int fa_dbg_count = 0;
+    if (fa_dbg_count < 10 && getenv("GGML_FA_DEBUG") != nullptr) {
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        fprintf(stderr, "FA debug: kernel=%d Q_n=%d kv=%d (kv%%256=%d)\n",
+                (int) kernel_chosen, (int) Q->ne[1], (int) K->ne[1], (int) (K->ne[1] % 256));
+        fa_dbg_count++;
+    }
+    switch (kernel_chosen) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
@@ -577,6 +637,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_VEC:
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_VEC_GQA:
+            ggml_cuda_flash_attn_ext_vec_gqa(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
