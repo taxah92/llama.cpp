@@ -2107,21 +2107,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
 
-        // offload draft sampling to the backend
+        // MTP drafting relies on CPU candidate inspection, p_min confidence checks,
+        // and greedy argmax sampling. Backend offloading skips candidate distribution
+        // formatting and causes draft acceptance collapse, so use CPU sampler.
+        this->params.backend_sampling = false;
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling) {
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_greedy());
-
-                if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
-                    SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
-                    llama_sampler_free(chain);
-                    chain = nullptr;
-                }
-                backend_chains[seq_id] = chain;
-            }
-        }
 
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
