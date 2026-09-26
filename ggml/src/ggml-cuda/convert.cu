@@ -335,6 +335,107 @@ static void dequantize_block_cuda(const void * vx, dst_t * y,
         (vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
 }
 
+// ---------------------------------------------------------------------------
+// [v100-opt] dequantize_q4_0_f16_nc: специализированный Q4_0 -> F16 для nc-источника.
+//
+// Зачем. Generic dequantize_block (выше) при ne00=256 и blockDim=256 распределяет
+// i00 = 2*tid, поэтому (а) половина блока (tid >= ne00/2) выходит сразу по
+// `if (i00 >= ne00)`, (б) на активный поток приходится 2 элемента = 4 байта, и
+// (в) lane'ы в каждой инструкции стора идут с шагом 4 байта, то есть пишется
+// каждый второй 32-байтовый сектор. Это ограничение по числу LSU-инструкций и
+// по неполным секторам, а не по пропускной способности: на V100 конверсия
+// Q4_0->F16 занимает ~1069 мкс на слой из ~1996 мкс всего attention (54%),
+// то есть ~492 ГБ/с при 525 МБ трафика.
+//
+// Как. Ровно 16 байт (8 элементов F16) на поток, одним STG.128: lane'ы
+// последовательно заполняют 512 байт на варп -> все секторы полные.
+// Чтение qs остаётся узким: блок Q4_0 = 18 байт, qs лежит по адресу 18*ib + 2
+// (выравнивание 2), поэтому 8 нибб-байт читаются восемью LDG.U16.
+// Итог: 9 инструкций памяти на 16 байт против 4 на 4 байта у generic-пути.
+//
+// Формула (nibble - 8)*d — та же, что в generic-пути для Q4_0, чтобы результат
+// совпадал с ним побитово (в generic: dequantize_q4_0 -> (v.x - 8.0f) * d).
+// Требуется ne00 % 8 == 0 (для 16-байтовой выровненности dst) и ne00 кратен QK4_0.
+// ---------------------------------------------------------------------------
+#define QK4_0_NC_PER_THREAD 8
+
+template <int nthreads>
+static __global__ void dequantize_q4_0_f16_nc_kernel(const void * __restrict__ vx, half * __restrict__ y,
+        const int64_t ne00, const int64_t ne01, const int64_t ne0203, const uint3 ne02_fdv,
+        const int64_t s01, const int64_t s02, const int64_t s03) {
+    constexpr int EPT = QK4_0_NC_PER_THREAD;
+
+    const int64_t total = ne0203*ne01*ne00 / EPT;
+
+    for (int64_t g = (int64_t)blockIdx.x*nthreads + threadIdx.x; g < total; g += (int64_t)gridDim.x*nthreads) {
+        const int64_t e0 = g*EPT;              // глобальный индекс первого элемента
+        const int64_t r  = e0 / ne00;          // = i0203*ne01 + i01
+        const int64_t ep = e0 - r*ne00;        // позиция в строке, кратна EPT
+
+        const int64_t i01    = r % ne01;
+        const int64_t i0203  = r / ne01;
+        const uint2  dm      = fast_div_modulo((uint32_t)i0203, ne02_fdv);
+        const int64_t i02    = dm.y;
+        const int64_t i03    = dm.x;
+
+        // 8 подряд идущих элемента лежат в одном блоке Q4_0, т.к. EPT | QK4_0.
+        // Позиция внутри блока кратна 8: 0 -> qs[0..7] младшие, 8 -> qs[8..15]
+        // младшие, 16 -> qs[0..7] старшие, 24 -> qs[8..15] старшие.
+        const int64_t ib    = i03*s03 + i02*s02 + i01*s01 + ep/QK4_0;
+        const int     e_in  = (int)(ep % QK4_0);
+        const int     qbase = (e_in & 8);            // 0 или 8
+        const bool    high  = (e_in & 16) != 0;      // старшие нибблы
+
+        const block_q4_0 * xb = (const block_q4_0 *) vx + ib;
+        const float d = __half2float(xb->d);
+
+        union { half2 h2[EPT/2]; uint4 v; } o;
+
+#pragma unroll
+        for (int k = 0; k < EPT/2; ++k) {
+            // Два отдельных байта, БЕЗ type-punning: qs лежит по адресу 18*ib + 2
+            // (выравнивание 2), и компилятор, увидев 4 uint16 подряд, сливает их
+            // в 32/64-битную загрузку -> misaligned address на V100.
+            const int b0 = xb->qs[qbase + 2*k + 0];
+            const int b1 = xb->qs[qbase + 2*k + 1];
+            const int n0 = high ? (b0 >> 4) : (b0 & 0xF);
+            const int n1 = high ? (b1 >> 4) : (b1 & 0xF);
+            o.h2[k] = __floats2half2_rn((n0 - 8.0f)*d, (n1 - 8.0f)*d);
+        }
+
+        // dst выровнен под STG.128: база 128 Б, r*ne00 и ep кратны 8 элементов.
+        *((uint4 *) (y + r*ne00 + ep)) = o.v;
+    }
+}
+
+static void dequantize_q4_0_f16_nc_cuda(const void * vx, half * y,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t s01, const int64_t s02, const int64_t s03, cudaStream_t stream) {
+    constexpr int nthreads = 256;
+
+    const int64_t ne0203 = ne02*ne03;
+    const int64_t total  = ne0203*ne01*ne00 / QK4_0_NC_PER_THREAD;
+
+    // Специализация применима, если ne00 кратен блоку Q4_0 и 8 (выравнивание dst
+    // под 16-байтовый стор), тензор не пустой, и dst выровнен. Иначе — общий путь.
+    if (ne00 > 0 && (ne00 % QK4_0) == 0 && (ne00 % QK4_0_NC_PER_THREAD) == 0 &&
+        total > 0 && ((uintptr_t)y & 15) == 0) {
+
+        const uint3 ne02_fdv = init_fastdiv_values(ne02);
+        const int64_t nblocks = (total + nthreads - 1) / nthreads;
+        // Ограничиваем сетку ~4096 блоками на SM, дальше работает grid-stride цикл.
+        const int64_t max_blocks = (int64_t) 4096 * ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+        const dim3 num_blocks((unsigned) std::min(nblocks, max_blocks), 1, 1);
+
+        dequantize_q4_0_f16_nc_kernel<nthreads><<<num_blocks, nthreads, 0, stream>>>
+            (vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
+        return;
+    }
+
+    dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0, half>
+        (vx, y, ne00, ne01, ne02, ne03, s01, s02, s03, stream);
+}
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static void dequantize_block_cont_cuda(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k, cudaStream_t stream) {
     dequantize_block_cuda<qk, qr, dequantize_kernel, dst_t>(vx, y, k, 1, 1, 1, k/qk, k/qk, k/qk, stream);
@@ -367,6 +468,75 @@ template<typename dst_t>
 static void dequantize_row_q4_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb32 = k / 32;
     const int nb = (k + 255) / 256;
+    dequantize_block_q4_0<<<nb, 32, 0, stream>>>(vx, y, nb32);
+}
+
+// ---------------------------------------------------------------------------
+// [v100-opt] dequantize_row_q4_0_f16_cont: специализированный Q4_0 -> F16 для
+// НЕПРЕРЫВНОГО источника. Именно этот путь использует боевой сервис
+// (kv_unified=false => ggml_is_contiguously_allocated(K) == true =>
+// fattn-common.cuh зовёт ggml_get_to_fp16_cuda, а не nc-вариант).
+//
+// Зачем. Старое dequantize_block_q4_0 (выше) на слой при k = 4*n_kv*256
+// элементов запускается как <<<nb, 32>>>: 8 блоков Q4_0 на блок, 8 элементов на
+// поток, запись восемью скалярными 2-байтовыми сторами, причём в каждой
+// инструкции стора lane'ы стоят с шагом 4 байта (y[32*ir + 4*il]) ->
+// заполняется 1/16 32-байтового сектора. Это ограничение по LSU-инструкциям и
+// по неполным секторам, а не по пропускной способности памяти.
+//
+// Как. Ровно 16 байт (8 элементов F16) на поток одним STG.128: lane'ы идут
+// подряд и заполняют секторы полностью, warp пишет 512 байт подряд.
+// Раскладка и формула (d*n + (-8*d)) совпадают со старым ядром бит в бит.
+// Требуется k % QK4_0 == 0 и 16-байтовая выровненность dst.
+// ---------------------------------------------------------------------------
+template <int nthreads>
+static __global__ void dequantize_q4_0_f16_cont_kernel(const void * __restrict__ vx, half * __restrict__ y,
+        const int64_t ngroups) {
+    // ngroups = k/8 — число 8-элементных групп; в блоке Q4_0 их ровно 4.
+    for (int64_t g = (int64_t)blockIdx.x*nthreads + threadIdx.x; g < ngroups; g += (int64_t)gridDim.x*nthreads) {
+        const int64_t ib  = g / 4;           // индекс блока Q4_0 (4 — константа компиляции)
+        const int     sub = (int)(g - ib*4); // 0: эл-ты 0..7   младшие qs[0..7]
+                                           // 1: эл-ты 8..15  младшие qs[8..15]
+                                           // 2: эл-ты 16..23 старшие qs[0..7]
+                                           // 3: эл-ты 24..31 старшие qs[8..15]
+        const block_q4_0 * xb = (const block_q4_0 *) vx + ib;
+
+        const float   d  = __half2float(xb->d);
+        const float   dm = -8.0f*d;
+        const uint8_t * q = xb->qs + (sub & 1)*8;
+        const bool    high = (sub & 2) != 0;
+
+        union { half2 h2[4]; uint4 v; } o;
+
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            // элементы 2k и 2k+1 приходят из РАЗНЫХ байт qs: 8 элементов = 8 байт
+            const int b0 = q[2*k + 0];
+            const int b1 = q[2*k + 1];
+            const int n0 = high ? (b0 >> 4) : (b0 & 0xF);
+            const int n1 = high ? (b1 >> 4) : (b1 & 0xF);
+            o.h2[k] = __floats2half2_rn(d*n0 + dm, d*n1 + dm);
+        }
+
+        *((uint4 *) (y + ib*QK4_0 + sub*8)) = o.v;
+    }
+}
+
+static void dequantize_row_q4_0_f16_cuda(const void * vx, half * y, const int64_t k, cudaStream_t stream) {
+    constexpr int nthreads = 256;
+
+    if (k > 0 && (k % QK4_0) == 0 && ((uintptr_t)y & 15) == 0) {
+        const int64_t ngroups    = k/8;
+        const int64_t nblocks    = (ngroups + nthreads - 1) / nthreads;
+        const int64_t max_blocks = (int64_t) 4096 * ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+        const dim3 num_blocks((unsigned) std::min(nblocks, max_blocks), 1, 1);
+
+        dequantize_q4_0_f16_cont_kernel<nthreads><<<num_blocks, nthreads, 0, stream>>>(vx, y, ngroups);
+        return;
+    }
+
+    const int64_t nb32 = k / 32;
+    const int64_t nb   = (k + 255) / 256;
     dequantize_block_q4_0<<<nb, 32, 0, stream>>>(vx, y, nb32);
 }
 
@@ -616,7 +786,7 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_block_cont_cuda<QK_PTQ1_0, QR_PTQ1_0, dequantize_ptq1_0>;
 #endif
         case GGML_TYPE_Q4_0:
-            return dequantize_row_q4_0_cuda;
+            return dequantize_row_q4_0_f16_cuda;  // [v100-opt] быстрый путь, см. выше
         case GGML_TYPE_Q4_1:
             return dequantize_row_q4_1_cuda;
         case GGML_TYPE_Q5_0:
@@ -747,7 +917,7 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
         case GGML_TYPE_PTQ1_0:
             return dequantize_block_cuda<QK_PTQ1_0, QR_PTQ1_0, dequantize_ptq1_0>;
         case GGML_TYPE_Q4_0:
-            return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
+            return dequantize_q4_0_f16_nc_cuda;  // [v100-opt] быстрый путь, см. ядро выше
         case GGML_TYPE_Q4_1:
             return dequantize_block_cuda<QK4_1, QR4_1, dequantize_q4_1>;
         case GGML_TYPE_Q5_0:
