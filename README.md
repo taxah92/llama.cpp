@@ -18,26 +18,46 @@
 > [!NOTE]
 > **taxah92 Fork: NVIDIA Volta (SM70 / Tesla V100) & MTP Optimizations**
 >
-> This fork ([taxah92/llama.cpp](https://github.com/taxah92/llama.cpp)) builds upon [PrismML-Eng/llama.cpp](https://github.com/PrismML-Eng/llama.cpp) (branch `prism`) with critical fixes and performance improvements specifically targeting **NVIDIA Volta (SM70, Tesla V100)** architectures and **MTP (Multi-Token Prediction)** speculative decoding:
+> This fork ([taxah92/llama.cpp](https://github.com/taxah92/llama.cpp)) builds upon [PrismML-Eng/llama.cpp](https://github.com/PrismML-Eng/llama.cpp) (branch `prism`) with fixes and performance work specifically targeting **NVIDIA Volta (SM70, Tesla V100)** and **MTP (Multi-Token Prediction)** speculative decoding. All numbers below were measured on a V100-SXM2-16GB as interleaved A/B runs in a single session (repeatability within a session σ ≈ 0.1%; note that clocks drift ~10% between sessions, so only same-session comparisons are meaningful).
 >
-> 1. **Volta Shared Memory Limit Fix for Flash Attention (`ggml-cuda/fattn-mma-f16.cuh`)**:
->    - On Volta (compute capability 7.0), warps execute with 32 columns per warp (compared to 16 on Ampere+). With default `nbatch_combine = 128`, combine shared memory was $8 \times 32 \times (128+4) \times 4 = 135\text{ KB}$, exceeding Volta's physical 96 KB SM limit and triggering fatal `cudaErrorInvalidValue` crashes.
->    - Added tuned Volta MMA kernel configs for $D_{KQ}=256, D_V=256$ and $D_{KQ}=320, D_V=256$ with `nbatch_combine = 64` (69 KB $\le$ 96 KB opt-in limit) and `nbatch_fa = 32` (35 KB $\le$ 48 KB hardware limit), enabling stable, native Flash Attention on Volta.
+> 1. **Fast `Q4_0` → `F16` KV dequantization (`ggml-cuda/convert.cu`)** — the main win:
+>    - **Why it matters.** With a quantized KV cache the flash-attention kernels need the whole context in F16, so every decode step converts the entire KV of every layer. At 100k tokens that is ~205 MB of F16 written per layer, i.e. ~3.5 GB of writes per step: $O(\text{context})$ work per generated token, and the single largest item in the decode step.
+>    - **Root cause (measured, not guessed).** The old path ran `dequantize_block_q4_0` as `<<<nb, 32>>>`: one warp per CTA, 8 elements per thread, eight scalar 2-byte stores, and the lanes of a single store instruction sit 4 bytes apart — filling only 1/16 of each 32-byte sector. The kernel was limited by store/LSU instructions and partial sectors, **not** by memory bandwidth: 301 GB/s.
+>    - **Fix.** A specialized contiguous kernel writes exactly 16 bytes (8 F16 values) per thread with a single `STG.128`, 256 threads per CTA, so lanes are consecutive and one warp fills 512 contiguous bytes. `qs` is read with eight `LDG.U8`, because a Q4_0 block is 18 bytes and only 2-byte aligned (wider loads fault with `misaligned address`, and type-punning `qs` lets nvcc merge 16-bit loads into a misaligned 32-bit one). The value layout is bit-identical to the old kernel, and the non-contiguous (`kv_view=1`) path got the same treatment. Host-side guards fall back to the old kernel on shapes or alignments that do not fit.
+>    - **Measured.** Conversion per layer at `kv=100096`: 1745.6 → **685.7 µs (−61%)**; non-contiguous path −35%. End to end with the model: **steps/s +23.5% at 100k** (11.31 → 13.98) and **+33% at 240k** (6.03 → 8.02), prefill +0.6%.
 >
-> 2. **Quantized KV Cache Flash Attention Vector Dispatch (`ggml-cuda/fattn.cu`)**:
->    - Adjusted `ggml_cuda_get_best_fattn_kernel` on Volta so quantized KV caches (`Q4_0` / `Q8_0`) select `BEST_FATTN_KERNEL_VEC` when $Q_{ne[1]} \le 4$ without multiplying by `gqa_ratio_eff`.
->    - This avoids falling back to MMA tile kernels that require dequantizing the entire KV context to FP16 in VRAM during MTP verification steps.
+> 2. **MTP draft sampling stays on the CPU, with upstream's stochastic top-k (`common/speculative.cpp`)**:
+>    - **Root cause fixed.** GPU backend offload (`backend_sampling`) bypasses construction of the CPU candidate chain, so candidate probabilities remain at $p = 0.0$. `draft()` then reads an unsorted array and emits a garbage token (e.g. `165552 ("ansir")`) on every step, collapsing draft acceptance to **0.00%**. Sampling is therefore forced onto the CPU (`this->params.backend_sampling = false`).
+>    - **Top-k deliberately left at upstream's 10, not greedy.** Greedy drafts (`sparams.top_k = 1`) were tried and reverted: decode throughput dropped by **~22%** because draft acceptance falls from ~72% to ~50%. Stochastic top-k=10 is both faster and closer to upstream behaviour.
+>    - **Measured** with `--spec-draft-n-max 2`: draft acceptance 46–53%, mean accepted length 1.8–2.0 tokens per step.
 >
-> 3. **MTP Draft Acceptance Fix & Deterministic Argmax Sampling (`common/speculative.cpp`)**:
->    - **Root Cause Fixed:** Attempting GPU backend offload (`backend_sampling`) bypassed CPU candidate distribution construction and probability calculations, leaving candidate probabilities at $p = 0.0\text{f}$. `draft()` read from the unsorted array and emitted garbage tokens (e.g. `165552 ("ansir")`) on every step, causing a 0.00% draft acceptance collapse.
->    - **Solution:** Enforced CPU-based greedy argmax sampling for MTP (`this->params.backend_sampling = false`, `sparams.top_k = 1`), restoring draft acceptance from **0%** to **50%–100% (avg ~61%)** and boosting generation speed from 25–35 tok/s to **52–70.5 tok/s**.
+> 3. **GQA head packing in the tile kernel at any KV length (`ggml-cuda/fattn-tile.cuh`)**:
+>    - Packing all query heads that share a KV head into one CTA is no longer restricted to KV lengths divisible by 256. It is neutral for this model (the KV length is always padded to a multiple of 256), but unpadded lengths get faster: at `kv=100000` one attention op goes 2252 → 1775 µs.
 >
-> 4. **Full 256K Context on 16GB VRAM (Tesla V100-SXM2-16GB)**:
->    - Verified stable 262,144-token context in **15,115 MiB / 16,384 MiB** VRAM on `Ternary-Bonsai-2-27B-Abliterated-PQ2_0-MTP.gguf` using `Q4_0` KV cache with mean-centering bias (`--kv-mean-center` with `LLAMA_ATTN_ROT_DISABLE=1`).
+> 4. **Full 256K context on 16GB VRAM (Tesla V100-SXM2-16GB)**:
+>    - Verified stable 262,144-token context in **~15.4 GiB of 16.1 GiB** VRAM on `Ternary-Bonsai-2-27B-Abliterated-PQ2_0-MTP.gguf`, using a `Q4_0` KV cache with the mean-centering bias file. `LLAMA_ATTN_ROT_DISABLE=1` is **mandatory** with that bias file (it was calibrated without K-cache rotation; without the flag model init aborts).
+>    - `-ub 1024` would give roughly 8% more prefill but does **not** fit at 256k even with ~940 MiB free: the VMM pool cannot assemble a contiguous block and startup aborts with `CUDA error: out of memory`. Use `-ub 768`.
 >
-> 5. **Multimodal Projector (`mmproj`) Sizing Guidelines for 16GB VRAM**:
+> 5. **Multimodal projector (`mmproj`) sizing guidelines for 16GB VRAM**:
 >    - **GPU Vision Offload (Fast, 281 prompt tok/s):** Set `--ctx-size 220000` with `--mmproj Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf` (uses 14,817 MiB VRAM, 1.57 GB headroom for image activation buffers). 512x512 image processes in 1.13s.
 >    - **Max Context (256K / 262,144 tokens):** Use `--no-mmproj-offload` to keep `mmproj` in host RAM (28 GB available), keeping full 256K context in VRAM with vision processing on CPU (~4.1s per image).
+>
+> **Tried and reverted** (listed so nobody repeats them — each was measured):
+>
+> | change | measured result |
+> | :--- | :--- |
+> | Volta MMA shared-memory configs (`fattn-mma-f16.cuh`) | prefill 430 → 362 tok/s (**−19%**); upstream's Ampere configs are faster on V100 |
+> | Forcing the vector FA kernel for quantized KV on Volta | steps/s 12.8 → 10.5 (**−18%**): the VEC kernel re-reads K/V once per query head because it does not pack heads. It is also never selected for GQA=6 anyway — selection requires $Q_{ne[1]} \cdot \text{gqa} \le 2$, and the minimum is 6 |
+> | Greedy MTP drafts (`top_k = 1`) | decode **−22%** |
+> | Reading `Q4_0` directly inside the tile kernel (skipping the F16 mirror) | 1888 vs 1593 µs per layer: in-kernel dequantization is issue-bound (~30 GB/s effective) and costs more than the one-off conversion |
+> | Bounding `#pragma unroll` in `flash_attn_tile_iter_KQ` | within run-to-run noise; the tile kernel is ILP-bound and prefers the full unroll |
+> | MMVQ launch-config sweep for sm_70 (`nwarps` × `rows_per_block`, 6 points) | every deviation from the generic config (4 warps, 2 rows) was **19–20% worse** |
+> | `VDR_PQ2_0 = 2` (two 32-value chunks per `vec_dot` call) | **−25%** (44.1 → 58.4 µs); upstream's "one chunk at a time for parallelism" is the right choice |
+> | Streaming stores (`st.global.wt`) for the F16 mirror | neutral (75.9 vs 75.8 µs per matmul) |
+>
+> **Where the remaining decode time goes** (own instrumentation, 100k context, clean decode step): `MUL_MAT` 48%, `FLASH_ATTN_EXT` 43%, everything else 9%. The step is GPU-bound — 63.9 ms of GPU time vs 17.9 ms of host time per graph. The GEMV path is `mul_mat_vec_q<ncols=2>` and runs at ~419 GB/s (47% of the V100's peak); the measured headroom is ~1.27x, and its launch parameters are already optimal.
+>
+> **Diagnostics.** Perf/eval cases for the paths this model actually takes (KV view variants, `kv=100096` padded lengths, permuted layouts, real `PQ2_0` weight shapes at n=1 and n=2) live in `tests/test-backend-ops.cpp`. A CUDA-event based per-operator timer is available through `GGML_OP_TIMING=1` (see `ggml-cuda/optiming.cuh`); it is inert unless the env var is set and requires `GGML_CUDA_DISABLE_GRAPHS=1`. Note that `ncu` against the running server deadlocks at the prefill→decode transition, so use this instrument instead.
 >
 > **Inspiration & Engineering Reference:**
 > - [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) — deep engineering reference for low-bit KV cache and attention optimizations on NVIDIA Volta (SM70, Tesla V100).
