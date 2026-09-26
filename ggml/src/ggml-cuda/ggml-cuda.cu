@@ -2065,6 +2065,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+#include "optiming.cuh"  // [v100-opt] тайминг операторов через CUDA-события (диагностика)
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
@@ -4455,7 +4457,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                // [v100-opt] тайминг операторов: имя региона — узел или оператор
+                const char * GGML_CUDA_OP_TIMING_NAME = ggml_cuda_op_timing_enabled()
+                    ? (ggml_cuda_op_timing_by_node() ? node->name : ggml_op_name(node->op)) : nullptr;
+                if (GGML_CUDA_OP_TIMING_NAME) {
+                    ggml_cuda_op_timing_begin(GGML_CUDA_OP_TIMING_NAME, cuda_ctx->stream());
+                }
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                if (GGML_CUDA_OP_TIMING_NAME) {
+                    ggml_cuda_op_timing_end(cuda_ctx->stream());
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -4508,6 +4519,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     for (auto it = gb10_pool_allocations.rbegin(); it != gb10_pool_allocations.rend(); ++it) {
         it->reset();
     }
+
+    // [v100-opt] забрать времена операторов (диагностика; выключено без GGML_OP_TIMING)
+    ggml_cuda_op_timing_flush();
 }
 
 #ifdef USE_CUDA_GRAPH

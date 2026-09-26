@@ -2,6 +2,7 @@
 
 #include "common.cuh"
 #include "convert.cuh"
+#include "optiming.cuh"  // [v100-opt] тайминг операторов
 #include "vecdotq.cuh"
 
 #include <cstdint>
@@ -1027,7 +1028,10 @@ void launch_fattn(
         half * K_f16 = (half *) f16_extra.K;
         if (ggml_is_contiguously_allocated(K)) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
+            // [v100-opt] тайминг операторов: конверсия K отдельно от ядра FA
+            if (ggml_cuda_op_timing_enabled()) { ggml_cuda_op_timing_begin("convert_K_to_f16", main_stream); }
             to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
+            if (ggml_cuda_op_timing_enabled()) { ggml_cuda_op_timing_end(main_stream); }
 
             nb11 = nb11*bs*sizeof(half)/ts;
             nb12 = nb12*bs*sizeof(half)/ts;
@@ -1061,7 +1065,10 @@ void launch_fattn(
             half * V_f16 = (half *) f16_extra.V;
             if (ggml_is_contiguously_allocated(V)) {
                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
+                // [v100-opt] тайминг операторов: конверсия V отдельно от ядра FA
+                if (ggml_cuda_op_timing_enabled()) { ggml_cuda_op_timing_begin("convert_V_to_f16", main_stream); }
                 to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
+                if (ggml_cuda_op_timing_enabled()) { ggml_cuda_op_timing_end(main_stream); }
                 V_data = (char *) V_f16;
 
                 nb21 = nb21*bs*sizeof(half)/ts;
