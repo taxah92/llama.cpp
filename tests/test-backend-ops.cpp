@@ -10581,6 +10581,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 100096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 100096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 100096, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
+    // [v100-opt] kv_view=0: НЕПРЕРЫВНЫЙ путь конверсии Q4_0->F16. Именно он
+    // использует боевой сервис (kv_unified=false => слой KV contiguous =>
+    // fattn-common.cuh зовёт ggml_get_to_fp16_cuda, а не nc-вариант).
+    // Кейсы выше с kv_view=1 меряют другой путь и для модели нерелевантны.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 100096, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 100096, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  {0, 1, 2, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  16384, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  16384, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  {0, 1, 2, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 100096, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  {0, 2, 1, 3}));
 
     for (int kv : { 4096, 8192, 16384, }) {
