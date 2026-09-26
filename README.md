@@ -35,7 +35,7 @@
 >    - Packing all query heads that share a KV head into one CTA is no longer restricted to KV lengths divisible by 256. It is neutral for this model (the KV length is always padded to a multiple of 256), but unpadded lengths get faster: at `kv=100000` one attention op goes 2252 → 1775 µs.
 >
 > 4. **Full 256K context on 16GB VRAM (Tesla V100-SXM2-16GB)**:
->    - Verified stable 262,144-token context in **~15.4 GiB of 16.1 GiB** VRAM on `Ternary-Bonsai-2-27B-Abliterated-PQ2_0-MTP.gguf`, using a `Q4_0` KV cache with the mean-centering bias file. `LLAMA_ATTN_ROT_DISABLE=1` is **mandatory** with that bias file (it was calibrated without K-cache rotation; without the flag model init aborts).
+>    - Verified stable 262,144-token context in **15,443 MiB of 16,144 MiB** VRAM on `Ternary-Bonsai-2-27B-Abliterated-PQ2_0-MTP.gguf`, using a `Q4_0` KV cache with the mean-centering bias file. `LLAMA_ATTN_ROT_DISABLE=1` is **mandatory** with that bias file (it was calibrated without K-cache rotation; without the flag model init aborts).
 >    - `-ub 1024` would give roughly 8% more prefill but does **not** fit at 256k even with ~940 MiB free: the VMM pool cannot assemble a contiguous block and startup aborts with `CUDA error: out of memory`. Use `-ub 768`.
 >
 > 5. **Multimodal projector (`mmproj`) sizing guidelines for 16GB VRAM**:
